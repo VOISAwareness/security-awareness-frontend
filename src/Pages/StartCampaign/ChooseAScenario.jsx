@@ -1,0 +1,978 @@
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useUserType } from '../../UserTypeContext/UserTypeContext';
+import {
+  ExternalLink,
+  ArrowRight,
+  Eye,
+  X
+} from 'lucide-react';
+import scenariosJsonData from '../Scenarios/ScenariosData.json';
+import { api } from '../../services/api';
+import { openCampaignDraft, parkCampaignDraft, useCampaignDraft } from '../../services/useCampaignDraft';
+import { useCampaigns } from '../../services/useCampaigns';
+import { currentActor } from '../../services/identity';
+import { scenariosForViewer } from '../../services/scenarioOwnership';
+import { editedScenarioIds, readScenarioDraftItems } from '../../services/scenarioDraftSync';
+import { campaignContentVersions, markAsked, wasAsked } from '../../services/resumePrompt';
+import {
+  BACK_TO_STEP_1,
+  IN_WIZARD,
+  START_FRESH_ID,
+  draftLabel,
+  hasProgress,
+  isOwnDraft,
+  latestSavedFirst,
+  routeForStep,
+  savedStep,
+  shouldOfferResume,
+  stepName,
+  templatePatch,
+  templatePick
+} from '../../services/campaignWizard';
+import DraftDialog from '../../GlobalComponents/DraftDialog';
+import DraftCards from '../../GlobalComponents/DraftCards';
+import { NEUTRAL_DRAFT_THEME } from '../../GlobalComponents/draftTheme';
+import ViewTabs from '../../GlobalComponents/ViewTabs';
+import chooseAScenarioStartFresh from '../../assets/ChooseAScenarioStartFresh.png';
+import draftArt from '../../assets/CreateNewOneStartNewCampaign.png';
+import { DEMO_USER } from '../../appConfig';
+import PageLoading from '../../GlobalComponents/PageLoading';
+
+// =========================================================================
+// 🎛️ SCALE & THEME CONSTANTS (STRICTLY PRESERVED)
+// =========================================================================
+const VarStartCampaignScale = 0.94;
+const VarOverallRoundednessScale = 0.5;
+
+const VODAFONE_FONT_STYLE = `
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Montserrat:wght@700;800;900&family=Plus+Jakarta+Sans:wght@500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap');
+  
+  .font-voda-exb {
+    font-family: 'Vodafone ExB', 'Montserrat', sans-serif;
+    font-weight: 900;
+  }
+  .font-mono-tech {
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .rounded-3xl { border-radius: ${Math.round(28 * VarOverallRoundednessScale)}px !important; }
+  .rounded-2xl { border-radius: ${Math.round(20 * VarOverallRoundednessScale)}px !important; }
+  .rounded-xl  { border-radius: ${Math.round(14 * VarOverallRoundednessScale)}px !important; }
+  .rounded-lg  { border-radius: ${Math.round(10 * VarOverallRoundednessScale)}px !important; }
+  .rounded-md  { border-radius: ${Math.round(6 * VarOverallRoundednessScale)}px !important; }
+`;
+
+export const CAMPAIGN_STEPS = [
+  { id: 'scenario', step: 1, titleLine1: 'Choose A', titleLine2: 'Scenario', path: '/start-campaign' },
+  { id: 'details', step: 2, titleLine1: 'Details &', titleLine2: 'Settings', path: '/start-campaign/details' },
+  { id: 'email', step: 3, titleLine1: 'Campaign', titleLine2: 'Email', path: '/start-campaign/email' },
+  { id: 'landing', step: 4, titleLine1: 'Landing', titleLine2: 'Page', path: '/start-campaign/landing-page' },
+  { id: 'training', step: 5, titleLine1: 'Add Training', titleLine2: 'Path', path: '/start-campaign/training' },
+  { id: 'review', step: 6, titleLine1: 'Review &', titleLine2: 'Publish', path: '/start-campaign/review' }
+];
+
+// Campaign drafts show the Scenarios drafts' art, turned from orange to blue,
+// so the two kinds of draft match without being mistaken for each other.
+const CAMPAIGN_DRAFT_ART_TINT = 'hue-rotate-[200deg]';
+
+// "Start Complete Fresh" goes through the same path as a scenario card.
+const START_FRESH = { scenarioId: START_FRESH_ID, scenarioName: 'Start Fresh' };
+
+// Difficulty colors exact to canvas design
+const DIFFICULTY_THEMES = {
+  Low: {
+    bgLight: '#CEFBEA',
+    bgDark: '#0D271E',
+    border: '#A8F5D8',
+    borderDark: '#174A37',
+    btnBg: 'bg-[#B6F5DC] hover:bg-[#A0EFCF] dark:bg-[#12382A]',
+    btnBorder: 'border-[#73D8B0] dark:border-[#1F5C44]',
+    btnText: 'text-slate-900 dark:text-emerald-100',
+    diffTextColor: 'text-[#16A34A] dark:text-[#4ADE80]'
+  },
+  Medium: {
+    bgLight: '#FFEFCE',
+    bgDark: '#2E200C',
+    border: '#FFE19C',
+    borderDark: '#4A3414',
+    btnBg: 'bg-[#FFE4AC] hover:bg-[#FEDC94] dark:bg-[#402D12]',
+    btnBorder: 'border-[#F8C86A] dark:border-[#5C411A]',
+    btnText: 'text-slate-900 dark:text-amber-100',
+    diffTextColor: 'text-amber-600 dark:text-amber-400'
+  },
+  High: {
+    bgLight: '#ECE8FF',
+    bgDark: '#22193E',
+    border: '#D8D0FF',
+    borderDark: '#392C63',
+    btnBg: 'bg-[#DDD5FF] hover:bg-[#CDC1FF] dark:bg-[#322359]',
+    btnBorder: 'border-[#B8A7FF] dark:border-[#4B3B7A]',
+    btnText: 'text-slate-900 dark:text-purple-100',
+    diffTextColor: 'text-purple-600 dark:text-purple-400'
+  }
+};
+
+// =========================================================================
+// 🌐 DYNAMIC ASSET & AWS S3 BUCKET RESOLVER
+// =========================================================================
+const S3_BUCKET_BASE_URL = (typeof import.meta !== 'undefined' && import.meta.env?.VITE_S3_SCENARIOS_BUCKET_URL) || '';
+
+const getScenarioImage = (coverImageId) => {
+  if (!coverImageId) return '';
+
+  if (coverImageId.startsWith('http://') || coverImageId.startsWith('https://')) {
+    return coverImageId;
+  }
+
+  if (S3_BUCKET_BASE_URL) {
+    const cleanBase = S3_BUCKET_BASE_URL.replace(/\/+$/, '');
+    const cleanId = coverImageId.replace(/^\/+/, '');
+    return `${cleanBase}/${cleanId}`;
+  }
+
+  try {
+    return new URL(`../Scenarios/${coverImageId}`, import.meta.url).href;
+  } catch (e) {
+    return `/assets/Scenarios/${coverImageId}`;
+  }
+};
+
+const ChooseAScenario = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const fromWizard = Boolean(location.state?.fromWizard);
+  // Back from step 2: still working on the campaign in progress (a template
+  // picked here changes it). Arriving any other way, a template starts a new one.
+  const editingCampaign = Boolean(location.state?.editingCampaign);
+  const userContext = useUserType?.() || {};
+
+  // The wizard draft now lives on the server; `draft` is null until it loads.
+  // Writes made before then are safe: flush() waits for the load.
+  // Lazy: nothing is saved until a template or Start fresh is picked, so
+  // opening this page never leaves an empty draft behind.
+  const { draft, loading, error: draftError, update, flush, startNew, campaignId } = useCampaignDraft({ lazy: true });
+
+  // ---------------------------------------------------------------------------
+  // Create new | Drafts: start a campaign from a template or Start fresh, or
+  // carry on with one of this person's unfinished campaigns (as listed under
+  // Campaigns → Drafts). Same switch as the Scenarios page. Drafts with nothing
+  // of the user's in them (hasProgress) are not listed: a blank one left by
+  // older versions, or one only opened from a template, which the next
+  // template reuses.
+  // ---------------------------------------------------------------------------
+  // "Save as draft" on a later step lands here on the Drafts tab, saying so.
+  const [view, setView] = useState(() => (location.state?.view === 'drafts' ? 'drafts' : 'all')); // 'all' | 'drafts'
+  const [savedNotice, setSavedNotice] = useState(() => location.state?.savedDraft || '');
+  // Used once: a reload is an ordinary visit again (and, like the other
+  // in-wizard arrivals, browser Back does not ask "Continue your campaign?").
+  useEffect(() => {
+    if (location.state?.view || location.state?.savedDraft) {
+      navigate(location.pathname, { replace: true, ...IN_WIZARD });
+    }
+  }, [location.state, location.pathname, navigate]);
+  useEffect(() => {
+    if (!savedNotice) return undefined;
+    const timer = setTimeout(() => setSavedNotice(''), 6000);
+    return () => clearTimeout(timer);
+  }, [savedNotice]);
+  const {
+    campaigns: draftCampaigns,
+    loading: draftsLoading,
+    pendingAction: draftAction,
+    remove: removeCampaign,
+  } = useCampaigns({ status: 'DRAFT' });
+  const [draftsError, setDraftsError] = useState('');
+  const actorEmail = currentActor();
+  // The one saved most recently first (the one in progress is put first by the cards).
+  const myDrafts = latestSavedFirst(
+    draftCampaigns.filter((c) => c.status === 'DRAFT' && isOwnDraft(c, actorEmail) && hasProgress(c))
+  );
+  // Open a draft on the step it was saved on, as Campaigns → Drafts does.
+  const continueCampaignDraft = (id) => {
+    const camp = myDrafts.find((c) => c.campaignId === id);
+    openCampaignDraft(id);
+    navigate(routeForStep(savedStep(camp)), IN_WIZARD);
+  };
+
+  const deleteCampaignDraft = async (id) => {
+    setDraftsError('');
+    try {
+      await removeCampaign(id);
+      // The draft this page was working on is gone: carry on with a fresh,
+      // not-yet-saved one (it is created by the next choice).
+      if (id === campaignId) await startNew();
+    } catch (e) {
+      setDraftsError(e?.message || 'Could not delete that draft.');
+    }
+  };
+
+  // Theme check
+  const [isDark, setIsDark] = useState(() => {
+    if (typeof document !== 'undefined') {
+      return document.documentElement.classList.contains('dark') || !!userContext.isDark;
+    }
+    return !!userContext.isDark;
+  });
+
+  useEffect(() => {
+    if (typeof userContext.isDark === 'boolean') {
+      setIsDark(userContext.isDark);
+    }
+  }, [userContext.isDark]);
+
+  useEffect(() => {
+    const checkDark = () => {
+      const hasDarkClass = document.documentElement.classList.contains('dark');
+      setIsDark(hasDarkClass || !!userContext.isDark);
+    };
+    checkDark();
+    const observer = new MutationObserver(checkDark);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+    return () => observer.disconnect();
+  }, [userContext.isDark]);
+
+  // Normalise a scenario row for display. Sorted by id because a DynamoDB scan
+  // returns no guaranteed order (and the cover-image fallback is index-based).
+  const normaliseScenarios = (rows) =>
+    [...(rows || [])]
+      .sort((a, b) => String(a.scenarioId).localeCompare(String(b.scenarioId)))
+      .map((s, idx) => ({
+        ...s,
+        difficulty: s.difficulty || 'Medium',
+        CreatedOn: s.CreatedOn || s.createdDate || '2-Jan-26',
+        CoverImageID: s.CoverImageID || `CovImg-${String(idx + 1).padStart(3, '0')}.png`
+      }));
+
+  // Scenarios come from the API (bundled JSON is only an offline fallback).
+  const [scenariosList, setScenariosList] = useState([]);
+  const [scenariosLoading, setScenariosLoading] = useState(true);
+
+  // Selected State — back from step 2, seeded from the campaign being worked on
+  // once it arrives; otherwise the first scenario once the list has loaded.
+  const [selectedScenarioId, setSelectedScenarioId] = useState('');
+
+  // Seed from the draft exactly once. Set the moment the user picks a card too,
+  // so a late-arriving draft never overrides a deliberate choice.
+  const scenarioSeededRef = useRef(false);
+
+  const pickScenario = (scenarioId) => {
+    scenarioSeededRef.current = true;
+    setSelectedScenarioId(scenarioId);
+  };
+
+  useEffect(() => {
+    if (!draft || scenarioSeededRef.current) return;
+    scenarioSeededRef.current = true;
+    // Same defaulting as before: only a saved scenarioId wins; otherwise the
+    // "first scenario in the list" fallback below stands. A campaign that is
+    // not being worked on here is not what a template click continues.
+    if (editingCampaign && draft.scenarioId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-time seed of local state from the async draft
+      setSelectedScenarioId(draft.scenarioId);
+    }
+  }, [draft, editingCampaign]);
+
+  useEffect(() => {
+    let active = true;
+    const viewer = currentActor();
+    const apply = (rows, editing) => {
+      if (!active) return;
+      setScenariosLoading(false);
+      // An older API sends every row, unannotated: keep what this person may see,
+      // less what they are editing (under Scenarios -> Drafts) until it is saved.
+      const list = normaliseScenarios(scenariosForViewer(rows, viewer)).filter(
+        (s) => !editing.has(String(s.scenarioId))
+      );
+      setScenariosList(list);
+      setSelectedScenarioId((prev) => prev || list[0]?.scenarioId || '');
+    };
+    // What this person may use: the templates, their own scenarios and their
+    // saved edited versions (a pending edit of a shared one stands in for it).
+    // A scenario of theirs with an unfinished edit is a draft for now, and
+    // drafts are never picked; a template always can be.
+    const editing = readScenarioDraftItems(api, viewer)
+      .then(editedScenarioIds)
+      .catch(() => new Set());
+    api.scenarios
+      .list({ viewer })
+      .then(async (rows) => apply(rows, await editing))
+      .catch(async (e) => {
+        console.error('Failed to load scenarios', e);
+        apply(scenariosJsonData?.scenarios || [], await editing);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const [detailModalItem, setDetailModalItem] = useState(null);
+  const [previewEmailHtml, setPreviewEmailHtml] = useState(null);
+
+  const findScenario = (scenarioId) =>
+    scenariosList.find((s) => s.scenarioId === scenarioId) || null;
+
+  // A draft card takes the colour of the template it came from, and the draft
+  // art of the Scenarios Drafts tab, tinted blue for campaigns.
+  const draftItems = myDrafts.map((c) => {
+    const step = savedStep(c);
+    const fresh = Boolean(c.isStartFresh) || c.scenarioId === START_FRESH_ID;
+    const template = fresh ? null : findScenario(c.scenarioId);
+    return {
+      id: c.campaignId,
+      code: c.campaignId,
+      title: draftLabel(c),
+      description:
+        String(c.campaignDescription || '').trim() ||
+        (c.scenarioName ? `Template: ${c.scenarioName}` : ''),
+      savedAt: c.updatedAt || c.createdAt,
+      step,
+      stepCount: 6,
+      stepName: stepName(step),
+      inProgress: c.campaignId === campaignId,
+      busy: draftAction === c.campaignId,
+      theme: template ? DIFFICULTY_THEMES[template.difficulty] || DIFFICULTY_THEMES.Low : NEUTRAL_DRAFT_THEME,
+      image: draftArt,
+      imageClassName: CAMPAIGN_DRAFT_ART_TINT,
+    };
+  });
+
+  // Coming back to the wizard from outside it: offer to continue the user's own
+  // campaign, left part-way, rather than silently dropping them on step 1.
+  // Asked once per campaign: after any answer it is simply a draft (Campaigns
+  // -> Drafts), and only a change to its content since then asks again (moving
+  // between steps is not a change; see resumePrompt.js). A campaign saved with
+  // "Save as draft" or opened from Drafts is never asked about.
+  // Closing the question (✕, Esc or a click outside) is "not now": the
+  // campaign stays as it is under Drafts and is not asked about again. Picking
+  // a template afterwards does not ask either: it starts a new campaign.
+  const resumeVersions = useMemo(() => campaignContentVersions(draft), [draft]);
+  const draftId = draft?.campaignId || '';
+  const askedBefore = Boolean(draftId) && wasAsked('campaign', draftId, resumeVersions);
+  const offerResume = !fromWizard && !loading && shouldOfferResume(draft) && !askedBefore;
+  const resumeStep = savedStep(draft);
+  const markResumeAnswered = () => markAsked('campaign', draftId, resumeVersions);
+
+  // Asked about before the wizard copied the template's landing page in:
+  // remember it as it is now, so a later edit to that page is a change.
+  const currentVersion = resumeVersions[0];
+  useEffect(() => {
+    if (askedBefore) markAsked('campaign', draftId, currentVersion);
+  }, [askedBefore, draftId, currentVersion]);
+
+  // Either choice also replaces this history entry with an in-wizard one, so
+  // browser Back never asks again.
+  const handleContinue = () => {
+    markResumeAnswered();
+    navigate(routeForStep(resumeStep), { replace: true, ...IN_WIZARD });
+  };
+
+  // The saved campaign is left exactly as it is (still a DRAFT, listed under
+  // Campaigns -> Drafts); this user simply gets a brand-new one.
+  const handleStartNew = async () => {
+    markResumeAnswered();
+    navigate(location.pathname, { replace: true, ...IN_WIZARD });
+    pickScenario(scenariosList[0]?.scenarioId || '');
+    await startNew();
+  };
+
+  // "Not now": nothing is written and the page stays as it is.
+  const handleNotNow = () => {
+    markResumeAnswered();
+    navigate(location.pathname, { replace: true, ...IN_WIZARD });
+  };
+
+  // A template the user asked for while the draft already holds their own email,
+  // landing page or training edits; confirmed in the "Replace your edits?" dialog.
+  const [replaceTarget, setReplaceTarget] = useState(null);
+
+  const goToDetails = async (fields) => {
+    try {
+      update({ ...fields, wizardStep: 2 });
+      await flush();
+    } catch (e) {
+      console.error(e);
+    }
+
+    if (detailModalItem) setDetailModalItem(null);
+    // Browser Back from step 2 lands here as the Back button does: no "Continue
+    // your campaign?" question, and still working on this campaign.
+    if (!editingCampaign) navigate(location.pathname, { replace: true, ...BACK_TO_STEP_1 });
+    navigate('/start-campaign/details', IN_WIZARD);
+  };
+
+  // Copy the template into the user's own campaign. Templates are read-only
+  // here: only the campaign draft is ever written.
+  const applyTemplate = (scenario) =>
+    goToDetails(templatePatch(scenario, draft || {}, findScenario(draft?.scenarioId)));
+
+  // "Use This" / "Let's Go" starts a new campaign from the template; a
+  // campaign in progress is left as it is under Drafts. Back from step 2 it
+  // changes the campaign being worked on instead: picking its own scenario
+  // keeps every edit, and switching to another one replaces the email, landing
+  // page and training, so it asks first when the user has changed any of them.
+  const handleUseScenario = async (scenario) => {
+    // Until the draft is known nothing can be compared, so nothing is applied.
+    if (!scenario || loading) return;
+    pickScenario(scenario.scenarioId);
+    const pick = templatePick({
+      editing: editingCampaign,
+      draft,
+      scenarioId: scenario.scenarioId,
+      previous: findScenario(draft?.scenarioId),
+    });
+    // A campaign in progress that could not be read right now is not
+    // continued either: the template still starts a new one.
+    const unread = !editingCampaign && !draft && Boolean(draftError);
+    if (pick === 'new' || unread) {
+      parkCampaignDraft(draft);
+      await startNew();
+      await goToDetails(templatePatch(scenario, {}, null));
+      return;
+    }
+    if (pick === 'same') {
+      await goToDetails({});
+      return;
+    }
+    if (pick === 'confirm') {
+      setReplaceTarget(scenario);
+      return;
+    }
+    await applyTemplate(scenario);
+  };
+
+  // Start from scratch / Start Fresh (Blank canvas: clears all template defaults)
+  const handleStartFresh = () => handleUseScenario(START_FRESH);
+
+  const handleConfirmReplace = async () => {
+    const scenario = replaceTarget;
+    setReplaceTarget(null);
+    await applyTemplate(scenario);
+  };
+
+  // Nothing is written; the highlight goes back to the campaign's scenario.
+  const handleKeepEdits = () => {
+    setReplaceTarget(null);
+    pickScenario(draft?.scenarioId || scenariosList[0]?.scenarioId || '');
+  };
+
+  const handleNextStep = async () => {
+    if (selectedScenarioId === START_FRESH_ID) {
+      await handleStartFresh();
+      return;
+    }
+    const selected = scenariosList.find((s) => s.scenarioId === selectedScenarioId) || scenariosList[0];
+    await handleUseScenario(selected);
+  };
+
+  return (
+    <>
+      <style>{VODAFONE_FONT_STYLE}</style>
+
+      {/* Screen Shell */}
+      <div
+        style={{ zoom: VarStartCampaignScale }}
+        className="w-full max-w-[1780px] mx-auto p-3 sm:p-3.5 -mt-2 select-none font-sans flex flex-col gap-2.5 h-[calc(108vh-0px)] overflow-hidden"
+      >
+        {/* ========================================================================= */}
+        {/* ── 1. TOP HEADER BAR: "Start New Campaign"                                */}
+        {/* ========================================================================= */}
+       <div
+        className={`w-full h-[40px] py-2.5 px-6 -mt-2 rounded-2xl border flex items-center justify-between flex-shrink-0 transition-colors duration-300 shadow-sm ${
+          isDark ? 'bg-white text-black border-white/10' : 'bg-[#000000] text-white border-black/10'
+        }`}
+      >
+        <div className="flex items-center gap-3">
+          <h1 className="text-[13.5px] font-bold tracking-tight uppercase">
+              Start New Campaign
+            </h1>
+          </div>
+          {/* Create new | Drafts (same switch as the Scenarios page) */}
+          <ViewTabs
+            variant="header"
+            ariaLabel="Start new campaign view"
+            isDark={isDark}
+            value={view}
+            onChange={setView}
+            tabs={[
+              { id: 'all', label: 'Create new' },
+              { id: 'drafts', label: 'Drafts', count: draftItems.length },
+            ]}
+          />
+        </div>
+
+        {/* ========================================================================= */}
+        {/* ── 2. MAIN CONTAINER WITH DOCKED STEPPER STRIP                            */}
+        {/* ========================================================================= */}
+        <div
+          className={`w-full flex-1 min-h-0 rounded-2xl border flex flex-col justify-between overflow-hidden shadow-xs relative ${
+            isDark ? 'bg-[#0F1015] border-white/10' : 'bg-white border-slate-200'
+          }`}
+        >
+          {/* Covered while the view's own data is on its way: the templates and
+              this person's draft (Create new), or their saved campaigns (Drafts). */}
+          <PageLoading show={view === 'all' ? scenariosLoading || loading : draftsLoading} isDark={isDark} />
+
+          {/* ── DOCKED CONTINUOUS STEPPER STRIP ── */}
+          <div
+            className={`w-full h-12 flex items-stretch flex-shrink-0 select-none pointer-events-none cursor-default ${
+              isDark ? 'border-white/10 bg-[#12141A]' : 'border-slate-200/90 bg-white'
+            }`}
+          >
+            {CAMPAIGN_STEPS.map((step) => {
+              const isCurrent = step.id === 'scenario';
+
+              if (isCurrent) {
+                return (
+                  <div
+                    key={step.id}
+                    className="bg-black dark:bg-white text-white px-14 py-3 flex items-center gap-3 flex-shrink-0 shadow-sm cursor-default"
+                  >
+                    <div className="w-6 h-6 rounded-full bg-white dark:bg-black text-black dark:text-white font-black flex items-center justify-center text-[12px] flex-shrink-0">
+                      {step.step}
+                    </div>
+                    <div className="flex flex-col text-white dark:text-black text-left leading-tight text-[11px] font-voda font-bold tracking-tight">
+                      <span>{step.titleLine1}</span>
+                      <span>{step.titleLine2}</span>
+                    </div>
+                  </div>
+                );
+              }
+
+              return (
+                <div
+                  key={step.id}
+                  className={`flex-1 flex items-center justify-center gap-2.5 px-3 py-3 cursor-default transition-opacity ${
+                    isDark ? 'opacity-80 text-white' : 'opacity-85 text-black'
+                  }`}
+                >
+                  <div
+                    className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-black flex-shrink-0 ${
+                      isDark ? 'bg-white text-black' : 'bg-black text-white'
+                    }`}
+                  >
+                    {step.step}
+                  </div>
+                  <div className="flex flex-col text-left leading-tight text-[11px] font-bold">
+                    <span>{step.titleLine1}</span>
+                    <span>{step.titleLine2}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ── 3. GALLERY CARDS: SQUARISH PROPORTIONS & RESOLVED COVER IMAGE ── */}
+          {view === 'all' ? (
+          <>
+          <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-3 pr-3 mt-1 mb-3 items-start flex flex-wrap gap-4 content-start [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-slate-300 dark:[&::-webkit-scrollbar-thumb]:bg-white/10 [&::-webkit-scrollbar-thumb]:rounded-md">
+            
+            {/* 🌟 START FRESH CARD (FIRST IN THE GALLERY) */}
+            <div
+              onClick={() => pickScenario(START_FRESH_ID)}
+              className={`relative p-4 rounded-3xl border transition-all duration-150 cursor-pointer flex flex-col justify-between overflow-hidden select-none w-full sm:w-[calc(50%-8px)] md:w-[calc(33.333%-11px)] lg:w-[calc(20%-13px)] min-w-[250px] max-w-[310px] h-[270px] shadow-2xs hover:shadow-md ${
+                isDark 
+                  ? 'bg-white text-black border-slate-200' 
+                  : 'bg-black text-white border-black/20'
+              } ${selectedScenarioId === START_FRESH_ID ? 'ring-1 ring-[#e66565]' : ''}`}
+            >
+              {/* Top Bar: "No Template Needed" Badge with Green Dot */}
+              <div className="flex items-center justify-between mb-1.5 z-10">
+                <div className={`inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full text-[9px] font-bold shadow-2xs ${
+                  isDark ? 'bg-black/95 text-white/90' : 'bg-white/95 text-black/90'
+                }`}>
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#16A34A] inline-block flex-shrink-0" />
+                  <span>No Template Needed</span>
+                </div>
+              </div>
+
+              {/* Title & Description */}
+              <div className="flex flex-col gap-1.5 text-left z-10 max-w-[70%]">
+                <h3 className="text-[15px] font-black leading-tight tracking-tight">
+                  Start Complete<br />Fresh
+                </h3>
+
+                <p className={`text-[9.5px] font-medium line-clamp-8 leading-relaxed ${
+                  isDark ? 'text-black/80' : 'text-white/80'
+                }`}>
+                  <strong className={isDark ? 'text-black' : 'text-white'}>Description: </strong>
+                  Start with a completely blank canvas without predefined templates. Design custom phishing lures tailored to your exact security needs. Take full control over sender details, landing pages, and payloads.
+                </p>
+              </div>
+
+              {/* Bottom Left "Let's Go ->" Button */}
+              <div className="pt-2 z-10 flex items-center">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleStartFresh();
+                  }}
+                  className={`px-3.5 py-1 rounded-lg border text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 shadow-2xs ${
+                    isDark 
+                      ? 'bg-black/95 hover:bg-black/90 text-white border-black/20' 
+                      : 'bg-white/95 hover:bg-white/90 text-black border-white/20'
+                  }`}
+                >
+                  <span>Let's Go</span>
+                  <ArrowRight className="w-3 h-3 stroke-[2.5]" />
+                </button>
+              </div>
+
+              {/* 3D Asset: Attached to walls, cropped ~10% bottom & 10% right */}
+              <div className="absolute -right-[5%] -bottom-[5%] w-[115px] h-[115px] pointer-events-none select-none flex items-center justify-center overflow-hidden">
+                <img
+                  src={chooseAScenarioStartFresh || '/assets/ChooseAScenarioStartFresh.png'}
+                  alt="Start Fresh"
+                  className="w-full h-full object-contain filter drop-shadow-md"
+                  loading="eager"
+                  onError={(e) => {
+                    if (!e.currentTarget.dataset.retried) {
+                      e.currentTarget.dataset.retried = 'true';
+                      e.currentTarget.src = '/assets/ChooseAScenarioStartFresh.png';
+                    }
+                  }}
+                />
+              </div>
+            </div>
+
+            {/* SCENARIOS LIST */}
+            {scenariosList.map((scenario) => {
+              const theme = DIFFICULTY_THEMES[scenario.difficulty] || DIFFICULTY_THEMES.Low;
+              const isSelected = selectedScenarioId === scenario.scenarioId;
+              const resolvedImageSrc = getScenarioImage(scenario.CoverImageID);
+
+              return (
+                <div
+                  key={scenario.scenarioId}
+                  onClick={() => pickScenario(scenario.scenarioId)}
+                  style={{
+                    backgroundColor: isDark ? theme.bgDark : theme.bgLight,
+                    borderColor: isSelected ? '#e66565' : isDark ? theme.borderDark : theme.border
+                  }}
+                  className={`relative p-4 rounded-3xl border transition-all duration-150 cursor-pointer flex flex-col justify-between overflow-hidden select-none w-full sm:w-[calc(50%-8px)] md:w-[calc(33.333%-11px)] lg:w-[calc(20%-13px)] min-w-[250px] max-w-[310px] h-[270px] shadow-2xs hover:shadow-md ${
+                    isSelected ? 'ring-1 ring-[#e66565]' : ''
+                  }`}
+                >
+                  {/* Top Bar: Pill Badge (Left) + Created on & Expand Button (Right) */}
+                  <div className="flex items-center justify-between mb-1.5 z-10">
+                    {/* ID Badge with red dot */}
+                    <div className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded-full text-[11px] font-bold bg-white/90 dark:bg-black/60 shadow-2xs text-slate-900 dark:text-white">
+                      <span className="w-1.5 h-1.5 rounded-full bg-[#E60000]" />
+                      <span>{scenario.scenarioId}</span>
+                    </div>
+
+                    {/* Created on & Expand Button */}
+                    <div className="flex items-center gap-1 text-[10px] font-bold text-slate-700 dark:text-slate-300">
+                      <span>Created on: {scenario.CreatedOn}</span>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDetailModalItem(scenario);
+                        }}
+                        className="p-1 rounded-md hover:bg-black/10 dark:hover:bg-white/10 text-slate-800 dark:text-slate-200 transition-colors cursor-pointer"
+                        title="View Full Scenario Details"
+                      >
+                        <ExternalLink className="w-3.5 h-3.5 stroke-[2.2]" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Title & Description & Type */}
+                  <div className="flex flex-col gap-1.5 text-left z-10 max-w-[70%]">
+                    <h3 className="text-[13.5px] font-black text-slate-950 dark:text-white leading-tight tracking-tight">
+                      {scenario.scenarioName}
+                    </h3>
+
+                    <p className="text-[9.5px] text-slate-700 dark:text-slate-300 font-medium line-clamp-8 leading-relaxed">
+                      <strong className="text-slate-900 dark:text-white">Description: </strong>
+                      {scenario.description}
+                    </p>
+
+                    <div className="text-[9.5px] font-bold text-slate-800 dark:text-slate-200 mt-0.5">
+                      Type: {scenario.campaignType}
+                    </div>
+                  </div>
+
+                  {/* Bottom Left "Use This ->" Button */}
+                  <div className="pt-2 z-10 flex items-center">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleUseScenario(scenario);
+                      }}
+                      className={`px-3.5 py-1 rounded-lg border text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1.5 shadow-2xs ${theme.btnBg} ${theme.btnBorder} ${theme.btnText}`}
+                    >
+                      <span>Use This</span>
+                      <ArrowRight className="w-3 h-3 stroke-[2.5]" />
+                    </button>
+                  </div>
+
+                  {/* ── 3D Asset: Attached to walls, cropped ~10% bottom & 10% right ── */}
+                  <div className="absolute -right-[10%] -bottom-[10%] w-[135px] h-[135px] pointer-events-none select-none flex items-center justify-center overflow-hidden">
+                    {resolvedImageSrc && (
+                      <img
+                        src={resolvedImageSrc}
+                        alt={scenario.scenarioName}
+                        className="w-full h-full object-contain filter drop-shadow-md"
+                        loading="eager"
+                        onError={(e) => {
+                          e.currentTarget.style.display = 'none';
+                        }}
+                      />
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          </>
+          ) : (
+            // No right padding here: the cards' own scroll area adds it, so the
+            // drafts are exactly as wide as the template cards.
+            <div className="flex-1 min-h-0 flex flex-col p-4 pr-0 sm:p-3 sm:pr-0 mt-1 mb-3">
+              {savedNotice && (
+                <span
+                  role="status"
+                  className="mb-2 self-start px-3 py-1.5 rounded-lg text-[10.5px] font-bold bg-[#8ED973]/15 text-[#2F7A17] dark:text-[#A6E88E]"
+                >
+                  Saved to Drafts: {savedNotice}. Continue it any time from its card.
+                </span>
+              )}
+              {draftsError && (
+                <span role="alert" className="mb-2 text-[10px] font-bold text-[#E60000]">{draftsError}</span>
+              )}
+              <DraftCards
+                items={draftItems}
+                loading={draftsLoading}
+                isDark={isDark}
+                onContinue={continueCampaignDraft}
+                onDelete={deleteCampaignDraft}
+                emptyText="A campaign you start and leave before submitting is kept here."
+              />
+            </div>
+          )}
+        </div>
+
+        {/* ========================================================================= */}
+        {/* ── 🌟 FULL SCENARIO SPECIFICATIONS MODAL                                 */}
+        {/* ========================================================================= */}
+        {detailModalItem && (
+          <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+            {(() => {
+              const modalTheme = DIFFICULTY_THEMES[detailModalItem.difficulty] || DIFFICULTY_THEMES.Low;
+              const modalImgSrc = getScenarioImage(detailModalItem.CoverImageID);
+
+              return (
+                <div
+                  style={{
+                    backgroundColor: isDark ? modalTheme.bgDark : modalTheme.bgLight,
+                    borderColor: isDark ? modalTheme.borderDark : modalTheme.border
+                  }}
+                  className="w-full max-w-3xl rounded-[18px] border-2 p-6 sm:p-7 relative overflow-hidden shadow-2xl flex flex-col gap-4 text-slate-900 dark:text-white animate-in fade-in zoom-in-95 duration-150"
+                >
+                  {/* Top Bar: Pill Badge (Left) + Go Back Button (Right) */}
+                  <div className="flex items-center justify-between">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-bold bg-white/90 dark:bg-black/60 shadow-2xs text-slate-900 dark:text-white">
+                      <span className="w-2 h-2 rounded-full bg-[#E60000]" />
+                      <span>{detailModalItem.scenarioId}</span>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setDetailModalItem(null)}
+                      className="px-4 py-1.5 rounded-xl bg-slate-500/80 hover:bg-slate-600 text-white font-bold text-xs uppercase cursor-pointer transition-colors"
+                    >
+                      Go Back
+                    </button>
+                  </div>
+
+                  {/* Title & Description */}
+                  <div className="flex flex-col gap-1">
+                    <h3 className="text-xl font-black tracking-tight text-slate-950 dark:text-white">
+                      {detailModalItem.scenarioName}
+                    </h3>
+                    <p className="text-[12px] font-medium text-slate-700 dark:text-slate-300 leading-relaxed">
+                      <strong>Description: </strong>
+                      {detailModalItem.description}
+                    </p>
+                    <div className="text-[11px] font-bold text-slate-800 dark:text-slate-300 mt-0.5">
+                      Created on: {detailModalItem.CreatedOn}
+                    </div>
+                  </div>
+
+                  <div className="w-full h-px bg-slate-400/30 dark:bg-white/10" />
+
+                  {/* 2x2 Specifications Grid */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-y-2.5 gap-x-6 text-[12px] font-medium text-slate-800 dark:text-slate-200">
+                    <div>
+                      <strong>Campaign Type: </strong>
+                      <span>{detailModalItem.campaignType}</span>
+                    </div>
+                    <div>
+                      <strong>Motivator: </strong>
+                      <span>{detailModalItem.motivator || 'Security / Urgency'}</span>
+                    </div>
+                    <div>
+                      <strong>Target Audience: </strong>
+                      <span>{detailModalItem.targetAudience}</span>
+                    </div>
+                    <div>
+                      <strong>Difficulty: </strong>
+                      <span className={`font-bold ${modalTheme.diffTextColor}`}>
+                        {detailModalItem.difficulty}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Email & Target Users Information Box */}
+                  <div className="p-4 rounded-2xl bg-white/50 dark:bg-black/40 border border-black/5 dark:border-white/10 flex flex-col gap-2 relative z-10">
+                    <h4 className="text-[13px] font-bold underline text-slate-900 dark:text-white">
+                      Email & Target Users Information
+                    </h4>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-y-2 gap-x-6 text-[11.5px] text-slate-700 dark:text-slate-300 font-medium">
+                      <div>
+                        <strong>Sender Email Id: </strong>
+                        <span className="font-mono-tech">{detailModalItem.senderEmailId}</span>
+                      </div>
+                      <div>
+                        <strong>Landing Page Id: </strong>
+                        <span className="font-mono-tech">{detailModalItem.landingPageId || 'LP-001'}</span>
+                      </div>
+                      <div>
+                        <strong>Sender Name: </strong>
+                        <span>{detailModalItem.senderName}</span>
+                      </div>
+                      <div>
+                        <strong>Training Id: </strong>
+                        <span className="font-mono-tech">{detailModalItem.trainingId || 'TP-005'}</span>
+                      </div>
+                      <div className="sm:col-span-2">
+                        <strong>Email Subject: </strong>
+                        <span>{detailModalItem.emailSubject}</span>
+                      </div>
+                    </div>
+
+                    {/* Preview Email Body Button */}
+                    <div className="pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setPreviewEmailHtml(detailModalItem.emailBody)}
+                        className="px-3 py-1 rounded-lg bg-white/90 dark:bg-black/60 text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-white/15 text-[10.5px] font-bold flex items-center gap-1.5 hover:bg-white shadow-2xs cursor-pointer"
+                      >
+                        <span>Preview Email Body</span>
+                        <Eye className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Bottom "Use This ->" Button & Modal Image */}
+                  <div className="flex items-center justify-between pt-1 relative">
+                    <button
+                      type="button"
+                      onClick={() => handleUseScenario(detailModalItem)}
+                      className={`px-5 py-2 rounded-xl border text-[12px] font-bold transition-all cursor-pointer flex items-center gap-2 shadow-2xs ${modalTheme.btnBg} ${modalTheme.btnBorder} ${modalTheme.btnText} hover:scale-105 active:scale-95 z-10`}
+                    >
+                      <span>Use This</span>
+                      <ArrowRight className="w-4 h-4 stroke-[2.5]" />
+                    </button>
+
+                    {/* 3D Visual in Modal Bottom Right */}
+                    <div className="absolute -right-[5%] -bottom-[15%] w-44 h-44 pointer-events-none select-none">
+                      {modalImgSrc && (
+                        <img
+                          src={modalImgSrc}
+                          alt={detailModalItem.scenarioName}
+                          className="w-full h-full object-contain filter drop-shadow-xl"
+                          onError={(e) => {
+                            e.currentTarget.style.display = 'none';
+                          }}
+                        />
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        {/* ========================================================================= */}
+        {/* ── 🌟 SIMULATED EMAIL BODY PREVIEW POPUP MODAL                            */}
+        {/* ========================================================================= */}
+        {previewEmailHtml && (
+          <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-6">
+            <div className="w-full max-w-2xl bg-white dark:bg-[#181A20] rounded-2xl overflow-hidden shadow-2xl border border-white/20 flex flex-col">
+              <div className="px-5 py-3 border-b border-slate-200 dark:border-white/10 flex items-center justify-between bg-slate-100 dark:bg-[#121418]">
+                <span className="text-xs font-bold text-slate-900 dark:text-white uppercase">
+                  Simulated Email Payload Preview
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setPreviewEmailHtml(null)}
+                  className="p-1 rounded text-slate-400 hover:text-black dark:hover:text-white cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <div className="p-4 overflow-y-auto max-h-[60vh] bg-slate-50 dark:bg-black/50">
+                <div
+                  className="bg-white p-5 rounded-xl shadow-xs border border-slate-200"
+                  dangerouslySetInnerHTML={{
+                    __html: previewEmailHtml
+                      .replace(/{{userName}}/g, DEMO_USER.name)
+                      .replace(/{{email}}/g, DEMO_USER.email)
+                      .replace(/{{department}}/g, 'AI & Data Analytics')
+                      .replace(/{{phishLink}}/g, '#training')
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <DraftDialog
+        open={offerResume}
+        isDark={isDark}
+        title="Continue your campaign?"
+        body="You have a campaign in progress. Pick up where you left off, or start a new one. Your saved campaign stays under Campaigns → Drafts either way."
+        detail={
+          <>
+            <span className="block">{draftLabel(draft)}</span>
+            <span className="block mt-0.5 font-medium opacity-80">
+              Saved at step {resumeStep} of 6: {stepName(resumeStep)}
+            </span>
+          </>
+        }
+        primaryLabel="Continue"
+        onPrimary={handleContinue}
+        secondaryLabel="Start new"
+        onSecondary={handleStartNew}
+        onClose={handleNotNow}
+        onDismiss={handleNotNow}
+      />
+
+      <DraftDialog
+        open={Boolean(replaceTarget)}
+        isDark={isDark}
+        tone="warning"
+        title="Replace your edits?"
+        body="Your campaign's email, landing page and training will be replaced by the ones in this template. Your schedule and recipient list stay as they are, and the template itself is not changed."
+        detail={
+          replaceTarget?.scenarioId === START_FRESH_ID
+            ? 'Start fresh: blank email, landing page and training'
+            : `Template: ${replaceTarget?.scenarioName || replaceTarget?.scenarioId || ''}`
+        }
+        primaryLabel="Replace with template"
+        onPrimary={handleConfirmReplace}
+        secondaryLabel="Keep my edits"
+        onSecondary={handleKeepEdits}
+      />
+    </>
+  );
+};
+
+export default ChooseAScenario;
